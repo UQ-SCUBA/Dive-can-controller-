@@ -32,16 +32,20 @@ template, which gives us several PlatformIO environments sharing one codebase:
 ## Project status (Milestone 1)
 
 **Working:** main dive screen (PO2, per-cell status, S.P., source, depth,
-deco stop/NDL, TTS, dive time, battery), the full ZHL-16C tissue-loading
-engine, and short-press Menu/Action behavior (S.P. edit, bailout gas
-select). On the `round` target this is flashed and confirmed working on
-real hardware (display, colors, backlight, and touch-pin Menu/Action all
-verified); elsewhere it's driven by a debug panel standing in for the real
-DiveCAN bus / depth sensor / physical buttons.
+deco stop/NDL, TTS, dive time, battery), the Gas Edit page, the full
+ZHL-16C tissue-loading engine, short-press Menu/Action behavior (S.P. edit,
+bailout gas select), and two of the three long-press gestures from the
+mockup — hold Menu alone to open/close the Gas Edit page, hold Action
+alone at the surface to power off. On the `round` target this is flashed
+and confirmed working on real hardware (display, colors, backlight, and
+touch-pin Menu/Action all verified); elsewhere it's driven by a debug
+panel standing in for the real DiveCAN bus / depth sensor / physical
+buttons.
 
 **Not built yet (next milestones):**
-- The Gas Edit page and the three long-press/combo gestures (gas-edit hold,
-  loop/bailout toggle, shutdown) from the mockup.
+- The Menu+Action combo gesture (OC/CCR loop/bailout toggle) from the
+  mockup — the only one of the three long-press/combo gestures not yet
+  implemented.
 - Real DiveCAN/TWAI bus parsing — protocol reference is now in
   `docs/DiveCAN_Protocol_Reference.md` (compiled from
   github.com/QuickRecon/DiveCAN), so this is unblocked, just not
@@ -110,10 +114,29 @@ macros (see `LGFX_GC9B72_360.hpp` or `LGFX_CYD_2432S028.hpp`), point
   gas mixes, tissue loading), ported from the mockup's JS `state` object.
 - `src/deco.h/.cpp` — the ZHL-16C engine: tissue integration, ceiling/NDL/
   stop-time/TTS projection.
-- `src/gestures.h/.cpp` — Menu/Action short-press dispatch.
-- `src/ui_dive_screen.h/.cpp` — the LVGL widget tree + per-tick refresh.
+- `src/gestures.h/.cpp` — Menu/Action short-press dispatch, plus the hold
+  gestures (gas-edit toggle, shutdown) and their idle timeouts.
+- `src/device_profile.h` — single source of truth for device screen
+  size/shape (`DEVICE_W`/`DEVICE_H`/`DEVICE_ROUND`), driven by the
+  `DEVICE_SHAPE_ROUND` build flag.
+- `src/ui_common.h` — shared color palette and label-creation helpers used
+  by every `ui_*.cpp` screen/overlay.
+- `src/ui_dive_screen.h`, `.cpp`/`_round.cpp` — the main dive screen's LVGL
+  widget tree + per-tick refresh; rect and round layouts are separate
+  files swapped per env (see `platformio.ini`'s `build_src_filter`), not a
+  single file branching on `DEVICE_SHAPE_ROUND`.
+- `src/ui_gas_edit_screen.h`, `.cpp`/`_round.cpp` — the Gas Edit page,
+  same rect/round split.
+- `src/ui_hold_bar.h`, `.cpp`/`_round.cpp` — the thin progress bar shown
+  across the top of the screen while a Menu/Action hold gesture is timing
+  out toward firing.
+- `src/ui_heartbeat.h`, `.cpp`/`_round.cpp` — the bottom-right liveness
+  indicator (currently a punctuation-symbol spinner) proving the UI loop
+  hasn't frozen, independent of the esp32 HAL's hardware watchdog.
+- `src/fonts/` — `lv_font_conv`-generated 7-segment (DSEG7) fonts for the
+  PO2 readout, round layout only.
 - `src/app.h/.cpp` — orchestration: builds the device-screen container,
   owns the periodic tick timer.
 - `src/input_sim_debug.h/.cpp` — sim-only debug panel (depth/cells/source/
-  Menu/Action), excluded from the `cyd` build.
+  Menu/Action), excluded from both real-hardware builds (`cyd`, `round`).
 - `hal/` — per-target display/input drivers (from the upstream template).
