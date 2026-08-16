@@ -1,28 +1,43 @@
 # DiveCAN Handset Firmware
 
-LVGL 9.3 firmware for a custom CCR handset targeting the ESP32-2432S028R
-("Cheap Yellow Display" — CYD): a DiveCAN bus client that also runs its own
-Bühlmann ZHL-16C deco model. See `~/Downloads/DiveCAN_Handset/` for the
-design summary, the APECS4 manual this UI's layout is modeled on, and the
-HTML/canvas mockup this firmware is being ported from.
+LVGL 9.3 firmware for a custom CCR handset targeting a 2.1" round 360x360
+GC9B72 SPI panel on an ESP32 dev board (bring-up board: ESPduino-32D): a
+DiveCAN bus client that also runs its own Bühlmann ZHL-16C deco model. See
+`~/Downloads/DiveCAN_Handset/` for the design summary, the APECS4 manual
+this UI's layout is modeled on, and the HTML/canvas mockup this firmware is
+being ported from.
+
+The project originally targeted the rectangular ESP32-2432S028R ("Cheap
+Yellow Display" — CYD); that target (`cyd`/`emulator_64bits`) is still in
+the tree as a secondary/reference build, but the round panel is now the
+primary hardware and `platformio.ini`'s default target.
 
 Built on the official [`lvgl/lv_platformio`](https://github.com/lvgl/lv_platformio)
-template, which gives us two PlatformIO environments sharing one codebase:
+template, which gives us several PlatformIO environments sharing one codebase:
 
-- **`emulator_64bits`** — runs against LVGL's SDL2 simulator on this machine.
-  This is the primary target for now, since there's no CYD hardware on hand
-  yet.
-- **`cyd`** — the real ESP32-2432S028R build, via
+- **`round`** — the primary hardware target: a 2.1" round 360x360 GC9B72
+  SPI panel (see `hal/esp32/displays/LGFX_GC9B72_360.hpp`), no touch IC on
+  the panel itself. Flashed and verified on real hardware — display init,
+  colors, and backlight all confirmed working. Menu/Action are read as
+  capacitive touch pins (GPIO2/GPIO4) as an interim stand-in until real
+  mechanical buttons are wired in.
+- **`emulator_round`** — SDL2 sim of the round panel (360x360 window), for
+  iterating on the round UI layout without the physical board.
+- **`emulator_64bits`** — SDL2 sim of the original rectangular layout.
+- **`cyd`** — the original rectangular ESP32-2432S028R build, via
   [LovyanGFX](https://github.com/lovyan03/LovyanGFX). Compiles, but is
-  unverified — see "Known gaps" below.
+  unverified against real hardware — kept as a secondary/fallback target
+  now that `round` is primary.
 
 ## Project status (Milestone 1)
 
-**Working (in the simulator):** main dive screen (PO2, per-cell status, S.P.,
-source, depth, deco stop/NDL, TTS, dive time, battery), the full ZHL-16C
-tissue-loading engine, and short-press Menu/Action behavior (S.P. edit,
-bailout gas select). Driven by a debug panel standing in for the real DiveCAN
-bus / depth sensor / physical buttons.
+**Working:** main dive screen (PO2, per-cell status, S.P., source, depth,
+deco stop/NDL, TTS, dive time, battery), the full ZHL-16C tissue-loading
+engine, and short-press Menu/Action behavior (S.P. edit, bailout gas
+select). On the `round` target this is flashed and confirmed working on
+real hardware (display, colors, backlight, and touch-pin Menu/Action all
+verified); elsewhere it's driven by a debug panel standing in for the real
+DiveCAN bus / depth sensor / physical buttons.
 
 **Not built yet (next milestones):**
 - The Gas Edit page and the three long-press/combo gestures (gas-edit hold,
@@ -33,25 +48,37 @@ bus / depth sensor / physical buttons.
   implemented yet. Cell/status values are still debug-panel inputs, not
   real bus messages.
 - Persisting gas mixes across power cycles (NVS/flash).
-- Physical Menu/Action button input on real hardware. The CYD has no
-  buttons of its own — whether that means two GPIO buttons wired in
-  separately or touchscreen zones is still an open question, so nothing is
-  wired up on the `cyd` build target yet.
+- Real mechanical Menu/Action buttons and the depth sensor, on `round` —
+  currently touch pins (GPIO2/GPIO4) stand in for the buttons, and depth is
+  still a debug-panel input.
+- Physical Menu/Action input on `cyd`. That panel has no buttons of its
+  own — whether that means two GPIO buttons wired in separately or
+  touchscreen zones is still an open question, so nothing is wired up on
+  that build target.
 
-**Known risk:** the CYD pin mapping in
-`hal/esp32/displays/LGFX_CYD_2432S028.hpp` is the widely-published
-community-standard one for this board, not yet verified against real
-hardware. Common surprises on this board: `pin_rst` sometimes actually wired
-to GPIO 4 instead of unconnected, and occasional `rgb_order`/`invert` flips
-between production runs. Recheck once the board arrives.
+**Known risk:** the `round` target's init command sequence
+(`hal/esp32/displays/LGFX_GC9B72_360.hpp`) is ported from a known-good
+reference driver for this exact chip and has been verified on real
+hardware (display brings up, colors correct after an `rgb_order` fix). The
+SPI bus still runs faster (40MHz) than that reference driver's own tested
+ceiling (~20MHz) — drop `cfg.freq_write` first if bring-up on a different
+board shows corruption/artifacts. Separately, the `cyd` pin mapping in
+`hal/esp32/displays/LGFX_CYD_2432S028.hpp` is still just the
+widely-published community-standard one for that board, not verified
+against real hardware. Common surprises on that board: `pin_rst` sometimes
+actually wired to GPIO 4 instead of unconnected, and occasional
+`rgb_order`/`invert` flips between production runs.
 
 ## Build / run
 
 ```sh
-# simulator (SDL2 window)
-pio run -e emulator_64bits -t upload
+# simulator (SDL2 window) -- round panel layout
+pio run -e emulator_round -t upload
 
-# real hardware build-check only — no board to flash yet
+# real hardware -- round GC9B72 panel, flash + run
+pio run -e round -t upload
+
+# rectangular CYD target -- secondary/reference, build-check only
 pio run -e cyd
 ```
 
@@ -73,8 +100,9 @@ then add its `bin` folder to PATH.
 
 Only relevant if targeting different hardware later. Add a new
 `hal/esp32/displays/*.hpp` exposing a LovyanGFX `tft` plus `WIDTH`/`HEIGHT`
-macros (see `LGFX_CYD_2432S028.hpp`), point `hal/esp32/app_hal.cpp`'s single
-include at it, and add a matching `[env:...]` in `platformio.ini`.
+macros (see `LGFX_GC9B72_360.hpp` or `LGFX_CYD_2432S028.hpp`), point
+`hal/esp32/app_hal.cpp`'s single include at it, and add a matching
+`[env:...]` in `platformio.ini`.
 
 ## Source layout
 
