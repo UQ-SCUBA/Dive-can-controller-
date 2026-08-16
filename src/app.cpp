@@ -11,7 +11,7 @@
 
 // Note on Menu/Action input: neither panel has physical buttons of its own
 // (unlike the APECS4 this UI is modeled on). On `round`, app_hal.cpp polls
-// two capacitive touch pins (GPIO2/GPIO4 -- see
+// two plain GPIO pins (GPIO25/GPIO26, internal pull-up -- see
 // displays/LGFX_GC9B72_360.hpp) and calls onMenuDown()/onMenuUp()/
 // onActionDown()/onActionUp() directly from there; that's a bench-testing
 // stand-in only, to be swapped for real mechanical buttons once those are
@@ -103,7 +103,11 @@ void appInit() {
   lv_obj_set_style_border_opa(roundEdgeGuide, LV_OPA_COVER, 0);
 #endif
 
-  lv_timer_create(tickTimerCb, 100, nullptr);
+  // 20ms (was 100ms) -- a 100ms tick can't reliably resolve short UI-cycle
+  // windows (see ui_dive_screen_round.cpp's PPO2_FLASH_OFF_MS): at 100ms
+  // sampling, whether a short-lived state gets drawn at all depends on
+  // where the tick happens to land relative to it.
+  lv_timer_create(tickTimerCb, 20, nullptr);
 }
 
 } // namespace dc

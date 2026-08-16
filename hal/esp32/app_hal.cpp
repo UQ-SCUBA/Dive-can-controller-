@@ -71,33 +71,131 @@ void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data)
 }
 #else
 // No touch IC on the round GC9B72 module's panel itself — Menu/Action are
-// standalone capacitive touch pins instead, for now (see
-// displays/LGFX_GC9B72_360.hpp's MENU_TOUCH_GPIO/ACTION_TOUCH_GPIO).
+// plain GPIO buttons instead (see displays/LGFX_GC9B72_360.hpp's
+// MENU_BTN_GPIO/ACTION_BTN_GPIO), internal pull-up, grounded on press.
 // Polled from hal_loop() below rather than through an lv_indev, since
 // these are discrete on/off inputs, not a pointer device.
 //
-// touchRead() on classic ESP32 (this board, not S2/S3) returns LOWER raw
-// counts when touched -- opposite of a mechanical active-low button read,
-// but the same "< threshold means pressed" shape. THRESHOLD is a rough
-// starting point for bare-wire/pad testing; tune per actual pad size and
-// wiring once real touch pads are in place.
-constexpr touch_value_t TOUCH_THRESHOLD = 40;
+// Interrupt-driven, not polled -- an earlier version read digitalRead()
+// once per hal_loop() iteration, which meant a press could only ever be
+// noticed as often as the main loop got back around to checking it. A slow
+// frame (the segmented bargraph's render cost, or anything else that ever
+// eats into a tick) directly ate into how many chances a quick press had to
+// be seen, and could stretch a short tap's *measured* duration to whatever
+// the loop's gap happened to be. attachInterrupt() below fires on every
+// pin transition the instant it happens, independent of whatever the main
+// loop/LVGL is doing, so a press is always captured at its true time.
+//
+// Debounced in the ISR itself (raw digitalRead() on a hand-grounded pin
+// with no debounce cap bounces for a few ms around each transition) by
+// ignoring any edge that lands within DEBOUNCE_MS of the last *accepted*
+// one -- collapses a bounce burst back to one clean edge per press without
+// needing to wait for N ms of stable polling (there's no polling anymore).
+constexpr uint32_t DEBOUNCE_MS = 25;
+
+// Do not hand only the current level to the main loop.  A complete short tap
+// can start and finish while LVGL is flushing a slow frame; in that case the
+// old level-only hand-off was back at "up" before pollButtons() ran and the
+// tap was lost.  This small single-producer (ISR), single-consumer (loop)
+// ring retains both edges until the main loop can dispatch them.
+constexpr uint8_t BUTTON_EVENT_QUEUE_SIZE = 8;
+
+struct ButtonEvent {
+  bool down;
+  uint32_t atMs;
+};
+
+struct ButtonIsrState {
+  volatile uint32_t lastEdgeMs = 0;  // millis() at the last accepted (non-bounce) edge
+  volatile bool rawDown = false;     // latest physical level, including filtered bounce edges
+  volatile uint8_t head = 0;         // next slot written by the ISR
+  volatile uint8_t tail = 0;         // next slot read by hal_loop()
+  ButtonEvent events[BUTTON_EVENT_QUEUE_SIZE];
+};
+
+static ButtonIsrState menuIsr;
+static ButtonIsrState actionIsr;
+
+static void IRAM_ATTR recordButtonEdge(ButtonIsrState *button, int pin) {
+  uint32_t now = millis();
+  // Always retain the current physical level, even for an edge rejected as
+  // bounce.  In particular, a very quick release can otherwise be filtered
+  // out after its press was accepted, leaving the logical button latched down.
+  button->rawDown = digitalRead(pin) == LOW;
+  if (now - button->lastEdgeMs < DEBOUNCE_MS) return;
+  button->lastEdgeMs = now;
+
+  const uint8_t head = button->head;
+  const uint8_t next = (head + 1) % BUTTON_EVENT_QUEUE_SIZE;
+  // There can only be two useful edges per physical tap, so eight entries
+  // gives the UI ample time to recover from a slow redraw.  If the consumer
+  // is stalled for still longer, retain the already queued event sequence
+  // rather than corrupting it by overwriting the oldest event.
+  if (next == button->tail) return;
+  button->events[head].down = button->rawDown;
+  button->events[head].atMs = now;
+  button->head = next; // publish only after the event has been written
+}
+
+// IRAM_ATTR: ISRs must live in IRAM on ESP32 so they're still reachable
+// while flash cache is disabled (e.g. mid flash-write) -- keep these tiny,
+// no Serial/heap/anything blocking. digitalRead()/millis() are both safe to
+// call from ISR context on ESP32.
+static void IRAM_ATTR menuPinIsr() {
+  recordButtonEdge(&menuIsr, MENU_BTN_GPIO);
+}
+
+static void IRAM_ATTR actionPinIsr() {
+  recordButtonEdge(&actionIsr, ACTION_BTN_GPIO);
+}
+
+// Drains ISR-captured edges into the gesture layer.  The ISR is the only
+// writer of head and the loop is the only writer of tail, so this is a simple
+// lock-free single-producer/single-consumer queue.
+static bool takeButtonEvent(ButtonIsrState *button, ButtonEvent *event) {
+  const uint8_t tail = button->tail;
+  if (tail == button->head) return false;
+  *event = button->events[tail];
+  button->tail = (tail + 1) % BUTTON_EVENT_QUEUE_SIZE;
+  return true;
+}
 
 static bool menuBtnWasDown = false;
 static bool actionBtnWasDown = false;
 
+static void dispatchMenuButton(bool down, uint32_t atMs) {
+  if (down == menuBtnWasDown) return;
+  menuBtnWasDown = down;
+  if (down) dc::onMenuDown(atMs);
+  else dc::onMenuUp(atMs);
+}
+
+static void dispatchActionButton(bool down, uint32_t atMs) {
+  if (down == actionBtnWasDown) return;
+  actionBtnWasDown = down;
+  if (down) dc::onActionDown(atMs);
+  else dc::onActionUp(atMs);
+}
+
 static void pollButtons(void)
 {
-  bool menuDown = touchRead(MENU_TOUCH_GPIO) < TOUCH_THRESHOLD;
-  bool actionDown = touchRead(ACTION_TOUCH_GPIO) < TOUCH_THRESHOLD;
+  ButtonEvent event;
+  while (takeButtonEvent(&menuIsr, &event)) {
+    dispatchMenuButton(event.down, event.atMs);
+  }
+  while (takeButtonEvent(&actionIsr, &event)) {
+    dispatchActionButton(event.down, event.atMs);
+  }
 
-  if (menuDown && !menuBtnWasDown) dc::onMenuDown();
-  else if (!menuDown && menuBtnWasDown) dc::onMenuUp();
-  menuBtnWasDown = menuDown;
-
-  if (actionDown && !actionBtnWasDown) dc::onActionDown();
-  else if (!actionDown && actionBtnWasDown) dc::onActionUp();
-  actionBtnWasDown = actionDown;
+  // An edge inside DEBOUNCE_MS is deliberately not queued.  Reconcile the
+  // latest raw level here so a filtered release never leaves a button stuck
+  // down.  This does not make the loop responsible for catching taps: the
+  // ISR queue above still captures every accepted press/release edge.
+  const uint32_t now = millis();
+  if (menuBtnWasDown != menuIsr.rawDown && now - menuIsr.lastEdgeMs >= DEBOUNCE_MS)
+    dispatchMenuButton(menuIsr.rawDown, now);
+  if (actionBtnWasDown != actionIsr.rawDown && now - actionIsr.lastEdgeMs >= DEBOUNCE_MS)
+    dispatchActionButton(actionIsr.rawDown, now);
 }
 #endif
 
@@ -155,9 +253,17 @@ void hal_setup(void)
   lv_indev_set_type(lvInput, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(lvInput, my_touchpad_read);
 #endif
-  // No pinMode() needed for MENU_TOUCH_GPIO/ACTION_TOUCH_GPIO in the round
-  // build -- touchRead() configures the touch peripheral on those pins
-  // itself, on first call.
+#if defined(DEVICE_SHAPE_ROUND)
+  // Internal pull-up: idles high, button press grounds the pin (see
+  // pollButtons() above and displays/LGFX_GC9B72_360.hpp's pin comment).
+  pinMode(MENU_BTN_GPIO, INPUT_PULLUP);
+  pinMode(ACTION_BTN_GPIO, INPUT_PULLUP);
+  // CHANGE: fire on both press and release edges -- menuPinIsr()/
+  // actionPinIsr() read the resulting level themselves rather than caring
+  // which direction triggered them.
+  attachInterrupt(digitalPinToInterrupt(MENU_BTN_GPIO), menuPinIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ACTION_BTN_GPIO), actionPinIsr, CHANGE);
+#endif
 }
 
 void hal_loop(void)
@@ -192,13 +298,13 @@ RTC_DATA_ATTR static time_t rtcSleepStartSec = 0; // 0 = no hal_enter_sleep() pe
 // gestures.cpp's Action-button handling.
 constexpr gpio_num_t TOUCH_IRQ_GPIO = GPIO_NUM_36;
 constexpr gpio_num_t WAKE_GPIO = TOUCH_IRQ_GPIO;
+#else
+// Round build's wake source is ACTION_BTN_GPIO itself (a valid RTC GPIO) --
+// same active-low button pollButtons() reads while awake, so waking is just
+// "press Action", matching its role as the wake button once the
+// pollButtons() short-press path is live again post-wake.
+constexpr gpio_num_t WAKE_GPIO = static_cast<gpio_num_t>(ACTION_BTN_GPIO);
 #endif
-// Round build's wake source is ACTION_TOUCH_GPIO itself, via
-// touchSleepWakeUpEnable() in hal_enter_sleep() below -- a level-based
-// esp_sleep_enable_ext0_wakeup() doesn't apply here since an untouched
-// capacitive pin doesn't hold a digital low the way a mechanical button
-// did, matching its role as the wake button once the pollButtons()
-// short-press path is live again post-wake.
 
 void hal_enter_sleep(void)
 {
@@ -215,25 +321,14 @@ void hal_enter_sleep(void)
   tft.sleep();
   tft.setBrightness(0);
 
-#if defined(DEVICE_SHAPE_ROUND)
-  // Same pin/threshold pollButtons() reads while awake (see its
-  // TOUCH_THRESHOLD comment above) -- this call sets the wake threshold
-  // and enables touchpad wakeup in one go.
-  touchSleepWakeUpEnable(ACTION_TOUCH_GPIO, TOUCH_THRESHOLD);
-#else
   esp_sleep_enable_ext0_wakeup(WAKE_GPIO, 0 /* wake on low */);
-#endif
   esp_deep_sleep_start(); // does not return
 }
 
 void hal_restore_from_sleep(void)
 {
   if (rtcSleepStartSec == 0) return; // fresh power-on/reset — nothing pending
-#if defined(DEVICE_SHAPE_ROUND)
-  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TOUCHPAD) return;
-#else
   if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0) return;
-#endif
 
   time_t now;
   time(&now);

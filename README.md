@@ -19,8 +19,13 @@ template, which gives us several PlatformIO environments sharing one codebase:
   SPI panel (see `hal/esp32/displays/LGFX_GC9B72_360.hpp`), no touch IC on
   the panel itself. Flashed and verified on real hardware — display init,
   colors, and backlight all confirmed working. Menu/Action are read as
-  capacitive touch pins (GPIO2/GPIO4) as an interim stand-in until real
-  mechanical buttons are wired in.
+  plain digital GPIOs (GPIO25/GPIO26), internal pull-up, grounded on press
+  by momentary buttons — an interim stand-in until real mechanical buttons
+  are wired in (an earlier capacitive-touch approach on GPIO2/GPIO4 wasn't
+  registering presses reliably on real hardware). Reads are
+  interrupt-driven (`attachInterrupt`, debounced in the ISR) rather than
+  polled, so a press is captured at its true time regardless of how long
+  the current UI frame takes to render — see `hal/esp32/app_hal.cpp`.
 - **`emulator_round`** — SDL2 sim of the round panel (360x360 window), for
   iterating on the round UI layout without the physical board.
 - **`emulator_64bits`** — SDL2 sim of the original rectangular layout.
@@ -34,18 +39,15 @@ template, which gives us several PlatformIO environments sharing one codebase:
 **Working:** main dive screen (PO2, per-cell status, S.P., source, depth,
 deco stop/NDL, TTS, dive time, battery), the Gas Edit page, the full
 ZHL-16C tissue-loading engine, short-press Menu/Action behavior (S.P. edit,
-bailout gas select), and two of the three long-press gestures from the
-mockup — hold Menu alone to open/close the Gas Edit page, hold Action
-alone at the surface to power off. On the `round` target this is flashed
-and confirmed working on real hardware (display, colors, backlight, and
-touch-pin Menu/Action all verified); elsewhere it's driven by a debug
-panel standing in for the real DiveCAN bus / depth sensor / physical
-buttons.
+bailout gas select), and all three long-press/combo gestures from the
+mockup — hold Menu alone to open/close the Gas Edit page, hold Action alone
+at the surface to power off, hold Menu+Action together to toggle Loop/
+Bailout source. On the `round` target this is flashed and confirmed
+working on real hardware (display, colors, backlight, and GPIO Menu/Action
+all verified); elsewhere it's driven by a debug panel standing in for the
+real DiveCAN bus / depth sensor / physical buttons.
 
 **Not built yet (next milestones):**
-- The Menu+Action combo gesture (OC/CCR loop/bailout toggle) from the
-  mockup — the only one of the three long-press/combo gestures not yet
-  implemented.
 - Real DiveCAN/TWAI bus parsing — protocol reference is now in
   `docs/DiveCAN_Protocol_Reference.md` (compiled from
   github.com/QuickRecon/DiveCAN), so this is unblocked, just not
@@ -53,12 +55,28 @@ buttons.
   real bus messages.
 - Persisting gas mixes across power cycles (NVS/flash).
 - Real mechanical Menu/Action buttons and the depth sensor, on `round` —
-  currently touch pins (GPIO2/GPIO4) stand in for the buttons, and depth is
-  still a debug-panel input.
+  currently GPIO25/GPIO26 (grounded-on-press, internal pull-up) stand in
+  for the buttons, and depth is still a debug-panel input.
 - Physical Menu/Action input on `cyd`. That panel has no buttons of its
   own — whether that means two GPIO buttons wired in separately or
   touchscreen zones is still an open question, so nothing is wired up on
   that build target.
+
+**Real-hardware responsiveness:** the round dive screen was measured at
+~400ms+ per UI tick on real hardware (vs. LVGL's own ~20ms tick period),
+making Menu/Action presses feel unreliable even with correct debouncing.
+Root cause: `lv_label_set_text()`/`lv_obj_set_style_*()` have no built-in
+change-detection — every call unconditionally reallocates/invalidates even
+when the new value is identical to what's already shown — and the
+tick-label ring (`poScale`, sized to the full screen for `lv_scale`'s round
+mode) meant any such invalidation forced LVGL to reconsider it too. Fixed
+by gating every per-tick label/style write on an actual value change (see
+`ui_dive_screen_round.cpp`'s `setLabelText()`/`setLabelColor()`) and by
+replacing the segmented PPO2 bargraph's many `lv_arc` objects (which shared
+one large bounding box) with a single custom-drawn widget
+(`ringDrawEventCb()`). Combined with switching the tissue/dive-time
+simulator's default speed from 60x (bench-testing acceleration) to 1x real
+time (`state.simSpeed`), real-hardware tick time is now ~40-50ms.
 
 **Known risk:** the `round` target's init command sequence
 (`hal/esp32/displays/LGFX_GC9B72_360.hpp`) is ported from a known-good
@@ -115,7 +133,8 @@ macros (see `LGFX_GC9B72_360.hpp` or `LGFX_CYD_2432S028.hpp`), point
 - `src/deco.h/.cpp` — the ZHL-16C engine: tissue integration, ceiling/NDL/
   stop-time/TTS projection.
 - `src/gestures.h/.cpp` — Menu/Action short-press dispatch, plus the hold
-  gestures (gas-edit toggle, shutdown) and their idle timeouts.
+  gestures (gas-edit toggle, shutdown, Menu+Action combo source toggle)
+  and their idle timeouts.
 - `src/device_profile.h` — single source of truth for device screen
   size/shape (`DEVICE_W`/`DEVICE_H`/`DEVICE_ROUND`), driven by the
   `DEVICE_SHAPE_ROUND` build flag.

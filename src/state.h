@@ -3,8 +3,6 @@
 
 // Direct port of the HTML mockup's `state` object
 // (~/Downloads/DiveCAN_Handset/handset-display-preview.html) to a C++ struct.
-// The OC/CCR-toggle combo gesture (Menu+Action held together) is still
-// unimplemented; everything else from the mockup is now ported.
 
 namespace dc {
 
@@ -52,7 +50,13 @@ struct State {
   float tissuesHe[NUM_COMPARTMENTS];
   float simMinutes = 0.0f;
   bool simRunning = true;
-  int simSpeed = 60; // sim-minutes per real second (debug-panel only)
+  // Scales real elapsed time into simulated dive time (see app.cpp's
+  // tickTimerCb(): dtMin = dtRealSec * (simSpeed/60)) -- 1 = real time (1
+  // sim-minute passes per real minute), 60 = 60x fast-forward. Was left at
+  // 60 for bench testing (to watch NDL/deco countdowns move without
+  // waiting); real time is the correct default now that there's a real
+  // depth input to eventually replace this whole tissue-loading stand-in.
+  int simSpeed = 1;
 
   // Displayed "DIVE TIME" — independent of the tissue/deco integration
   // above (which always tracks actual elapsed time regardless of depth).
@@ -104,6 +108,14 @@ struct State {
   bool menuLongFired = false;
   uint32_t menuDownAtMs = 0; // 0 = not currently timing a hold
   float menuProgress = 0.0f; // 0..1 while holding toward the gas-edit toggle; 0 otherwise
+
+  // Hold-Menu+Action-together gesture: toggles source between Loop (CCR)
+  // and Bailout (OC). Tracked separately from menuDown/actionDown above
+  // (those still drive the individual gas-edit/shutdown hold gestures) —
+  // see gesturesTick()'s canCombo.
+  bool comboLongFired = false;
+  uint32_t comboDownAtMs = 0; // 0 = not currently timing a hold
+  float comboProgress = 0.0f; // 0..1 while holding toward the source toggle; 0 otherwise
 };
 
 // Decompression display values, recomputed periodically — mirrors the

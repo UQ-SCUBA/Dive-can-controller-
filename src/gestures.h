@@ -3,8 +3,7 @@
 #include <cstdint>
 
 // Short-press Menu/Action dispatch and the hold gestures, ported from the
-// mockup's pressMenu()/pressAction()/updateButtonHold(). The Menu+Action
-// combo gesture (OC/CCR toggle) is still unimplemented.
+// mockup's pressMenu()/pressAction()/updateButtonHold().
 
 namespace dc {
 
@@ -12,6 +11,7 @@ constexpr uint32_t SP_EDIT_TIMEOUT_MS = 5000; // matches the manual's 5s idle ti
 constexpr uint32_t GAS_EDIT_IDLE_TIMEOUT_MS = 15000; // gas-edit gets more room to think than SP_EDIT_TIMEOUT_MS
 constexpr uint32_t SHUTDOWN_HOLD_MS = 3500; // hold Action alone at the surface (<0.2m) to power off
 constexpr uint32_t GAS_EDIT_HOLD_MS = 3500; // hold Menu alone to open/close the gas-edit page
+constexpr uint32_t COMBO_HOLD_MS = 3500; // hold Menu+Action together to toggle Loop/Bailout source
 // Below this, releasing Menu is a short press (cycle S.P./gas/gas-edit-field);
 // at or above it but short of GAS_EDIT_HOLD_MS, releasing is an aborted hold
 // and does nothing — avoids accidentally cycling the field/mix when the
@@ -29,18 +29,24 @@ void pressAction();
 // aborted hold rather than a short press (Menu only — see
 // MENU_SHORT_PRESS_MAX_MS). onActionUp() also wakes the device back up if
 // it was sleeping.
-void onMenuDown();
-void onMenuUp();
-void onActionDown();
-void onActionUp();
+// Pass the edge timestamp when the input source has one (the ESP32 GPIO ISR
+// does).  The zero default keeps simulator callers simple and uses LVGL's
+// current tick there.
+void onMenuDown(uint32_t nowMs = 0);
+void onMenuUp(uint32_t nowMs = 0);
+void onActionDown(uint32_t nowMs = 0);
+void onActionUp(uint32_t nowMs = 0);
 
 // Call periodically (e.g. every UI tick) with the current lv_tick_get() value
 // — reverts uiMode to Dive after an idle timeout (SP_EDIT_TIMEOUT_MS, or
 // GAS_EDIT_IDLE_TIMEOUT_MS while in the gas-edit page), turns a sustained
-// Action hold into state.sleeping once it reaches SHUTDOWN_HOLD_MS, and
-// turns a sustained Menu hold into entering/exiting the gas-edit page once
-// it reaches GAS_EDIT_HOLD_MS — from any uiMode (e.g. holding through an
-// already-open S.P./gas-select box works, not just from a fresh press).
+// Action hold into state.sleeping once it reaches SHUTDOWN_HOLD_MS, turns a
+// sustained Menu hold into entering/exiting the gas-edit page once it
+// reaches GAS_EDIT_HOLD_MS (from any uiMode — e.g. holding through an
+// already-open S.P./gas-select box works, not just from a fresh press), and
+// turns a sustained Menu+Action-together hold into a Loop/Bailout source
+// toggle once it reaches COMBO_HOLD_MS (takes priority over the two
+// individual-button hold gestures above while both are down).
 void gesturesTick(uint32_t nowMs);
 
 // Skips disabled slots; returns fromIdx unchanged if none are enabled.

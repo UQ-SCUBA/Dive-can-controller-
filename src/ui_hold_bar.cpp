@@ -25,12 +25,15 @@ void uiHoldBarCreate(lv_obj_t *parent) {
 }
 
 void uiHoldBarUpdate() {
-  // Priority order mirrors the mockup's drawHoldProgress(): combo (not yet
-  // implemented) > Menu-hold (gas-edit toggle, cyan) > Action-hold
+  // Priority order mirrors the mockup's drawHoldProgress(): combo (source
+  // toggle, yellow) > Menu-hold (gas-edit toggle, cyan) > Action-hold
   // (shutdown, red).
   float frac = 0.0f;
   lv_color_t color = colCyan();
-  if (state.menuProgress > 0.0f) {
+  if (state.comboProgress > 0.0f) {
+    frac = state.comboProgress;
+    color = colYellow();
+  } else if (state.menuProgress > 0.0f) {
     frac = state.menuProgress;
     color = colCyan();
   } else if (state.actionProgress > 0.0f) {

@@ -36,15 +36,16 @@
 #define WIDTH 360
 #define HEIGHT 360
 
-// Menu/Action input — capacitive touch pins (ESP32 touch channels T2/T0),
-// for now, ahead of real mechanical buttons being wired in. Chosen over
-// T9/T8 (GPIO32/33) for easier physical access on this board. Note GPIO2
-// is a boot-mode strapping pin (must read low/floating at reset for a
-// normal flash boot) -- shouldn't matter in practice since nothing else
-// drives it, but worth knowing if boot ever gets flaky. See app_hal.cpp's
-// DEVICE_SHAPE_ROUND input path.
-#define MENU_TOUCH_GPIO 2
-#define ACTION_TOUCH_GPIO 4
+// Menu/Action input — plain digital GPIOs, internal pull-up, wired to
+// momentary buttons that ground the pin on press (active-low). Replaces an
+// earlier capacitive-touch (touchRead()) approach that wasn't registering
+// presses reliably on real hardware. Moved off GPIO2/GPIO4 (still unclear
+// whether that pair is actually reaching the chip on this board) onto
+// GPIO25/GPIO26 -- both plain ADC2/RTC-capable pins, no boot-strapping role,
+// no other claim on them from this panel's SPI/backlight wiring (18/23/16/
+// 14/13/17). See app_hal.cpp's DEVICE_SHAPE_ROUND input path.
+#define MENU_BTN_GPIO 25
+#define ACTION_BTN_GPIO 26
 
 namespace lgfx {
 inline namespace v1 {

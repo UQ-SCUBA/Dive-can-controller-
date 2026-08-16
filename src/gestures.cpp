@@ -113,16 +113,19 @@ void pressAction() {
   }
 }
 
-void onMenuDown() {
+void onMenuDown(uint32_t nowMs) {
+  if (nowMs == 0) nowMs = lv_tick_get();
   if (state.sleeping) return; // powered off — ignore input until woken
   state.menuDown = true;
+  state.menuDownAtMs = nowMs;
   state.menuLongFired = false;
-  lastInteractionMs = lv_tick_get();
+  lastInteractionMs = nowMs;
 }
 
-void onMenuUp() {
+void onMenuUp(uint32_t nowMs) {
+  if (nowMs == 0) nowMs = lv_tick_get();
   if (!state.menuDown) return;
-  uint32_t heldMs = state.menuDownAtMs == 0 ? 0 : (lv_tick_get() - state.menuDownAtMs);
+  uint32_t heldMs = state.menuDownAtMs == 0 ? 0 : (nowMs - state.menuDownAtMs);
   // Below MENU_SHORT_PRESS_MAX_MS: a short press — cycle S.P./gas/gas-edit
   // field. At/above it (but under GAS_EDIT_HOLD_MS, so the long-press
   // gesture hasn't already fired): an aborted hold, so letting go early
@@ -135,17 +138,20 @@ void onMenuUp() {
   if (fireShort) pressMenu();
 }
 
-void onActionDown() {
+void onActionDown(uint32_t nowMs) {
+  if (nowMs == 0) nowMs = lv_tick_get();
   if (state.sleeping) {
     wakeArmed = true; // this press is a wake attempt, not a hold — see onActionUp()
     return;
   }
   state.actionDown = true;
+  state.actionDownAtMs = nowMs;
   state.actionLongFired = false;
-  lastInteractionMs = lv_tick_get();
+  lastInteractionMs = nowMs;
 }
 
-void onActionUp() {
+void onActionUp(uint32_t nowMs) {
+  if (nowMs == 0) nowMs = lv_tick_get();
   if (state.sleeping) {
     if (!wakeArmed) return; // e.g. the tail end of the hold that caused sleep — not a fresh press
     wakeArmed = false;
@@ -157,7 +163,7 @@ void onActionUp() {
     // surface interval, same as updateDiveTimer() would if ticks had kept
     // running (sleeping is only reachable at the surface, so all of it is
     // surface time).
-    uint32_t elapsedMs = lv_tick_get() - sleepStartMs;
+    uint32_t elapsedMs = nowMs - sleepStartMs;
     float elapsedMin = elapsedMs / 60000.0f;
     if (elapsedMin > 0.0f) {
       stepTissues(state.tissuesN2, state.tissuesHe, SURFACE_N2, 0.0f, elapsedMin);
@@ -169,12 +175,13 @@ void onActionUp() {
     }
 
     state.sleeping = false;
-    lastInteractionMs = lv_tick_get();
+    lastInteractionMs = nowMs;
     return;
   }
 
   if (!state.actionDown) return;
-  bool fireShort = !state.actionLongFired;
+  uint32_t heldMs = state.actionDownAtMs == 0 ? 0 : (nowMs - state.actionDownAtMs);
+  bool fireShort = !state.actionLongFired && heldMs < SHUTDOWN_HOLD_MS;
   state.actionDown = false;
   state.actionDownAtMs = 0;
   state.actionProgress = 0.0f;
@@ -215,7 +222,36 @@ void gesturesTick(uint32_t nowMs) {
     state.uiMode = UiMode::Dive; // idle timeout — cancels without committing
   }
 
-  bool canShutdown = state.uiMode == UiMode::Dive && state.depth < SURFACE_DEPTH_M;
+  // Combo (Menu+Action together): toggles Loop/Bailout source. Takes
+  // priority over the two individual hold gestures below while both
+  // buttons are down -- canShutdown/canGasEditHold each exclude the other
+  // button also being down, so a combo hold never also accumulates toward
+  // gas-edit or shutdown.
+  bool canCombo = state.menuDown && state.actionDown;
+  if (!canCombo) {
+    state.comboDownAtMs = 0;
+    state.comboProgress = 0.0f;
+    state.comboLongFired = false;
+  } else {
+    if (state.comboDownAtMs == 0) state.comboDownAtMs = nowMs;
+    uint32_t heldMs = nowMs - state.comboDownAtMs;
+    state.comboProgress = heldMs >= COMBO_HOLD_MS ? 1.0f : (float)heldMs / (float)COMBO_HOLD_MS;
+    if (!state.comboLongFired && heldMs >= COMBO_HOLD_MS) {
+      state.comboLongFired = true;
+      setSource(state.source == Source::Loop ? Source::Bailout : Source::Loop);
+      // Consume both presses so releasing afterward doesn't also fire
+      // onMenuUp()/onActionUp()'s short-press dispatch.
+      state.menuDown = false;
+      state.menuDownAtMs = 0;
+      state.menuProgress = 0.0f;
+      state.actionDown = false;
+      state.actionDownAtMs = 0;
+      state.actionProgress = 0.0f;
+      lastInteractionMs = nowMs;
+    }
+  }
+
+  bool canShutdown = state.uiMode == UiMode::Dive && state.depth < SURFACE_DEPTH_M && !state.menuDown;
   if (accumulateHold(state.actionDown && canShutdown, nowMs, SHUTDOWN_HOLD_MS, &state.actionDown,
                       &state.actionDownAtMs, &state.actionLongFired, &state.actionProgress)) {
     state.sleeping = true;

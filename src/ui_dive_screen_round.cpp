@@ -33,6 +33,11 @@ constexpr int32_t PPO2_MAX_CBAR = 170; // 1.70 bar
 constexpr int32_t PPO2_RED_LOW_MAX_CBAR = 50;   // red zone: 0.30-0.50
 constexpr int32_t PPO2_RED_HIGH_MIN_CBAR = 140; // red zone: 1.40-1.70 (extends to PPO2_MAX_CBAR)
 
+// ---- low-PO2 headline warning cycle (value <-> "LOW PPO2") ----
+constexpr float PPO2_FLASH_THRESHOLD = 0.35f;
+constexpr uint32_t PPO2_FLASH_OFF_MS = 500;     // "LOW PPO2" shown for this long
+constexpr uint32_t PPO2_FLASH_PERIOD_MS = 1000; // ...then the value for the remaining 0.5s
+
 constexpr int32_t PPO2_SCALE_ANGLE_RANGE = 150; // sweeps low end -> high end
 // Centered symmetrically on 270 deg (12 o'clock, in lv_scale's clockwise-
 // from-3-o'clock convention) -- rotation + angle_range/2 = 270. An earlier
@@ -63,31 +68,109 @@ constexpr int DEPTH_FRAC_Y = DEPTH_VALUE_Y + (40 - 20);
 // itself (below) is kept only for the tick marks + number labels -- its own
 // main arc is made fully transparent.
 constexpr int SEGMENT_COUNT = 14;          // (1.70-0.30)/0.10 -- one "real" (independently colored)
-                                            // segment per 0.1 bar; each is drawn as SEGMENT_SUBDIV
-                                            // narrower rectangles below for a denser look without
-                                            // actually tracking finer-grained lit/unlit state.
-constexpr int SEGMENT_SUBDIV = 5;          // purely-visual rectangles per real segment
+                                            // segment per 0.1 bar.
+// Narrower sub-bars per real segment, purely for a denser look -- doesn't
+// track finer-grained lit/unlit state, see poSegmentColState below (one
+// entry per *zone*, not per sub-bar).
+//
+// This used to be SEGMENT_COUNT separate lv_arc objects (one per sub-bar,
+// up to 70 total at SEGMENT_SUBDIV=5). Every one of those shared an
+// identical ~300x300 bounding box (lv_arc's box has to stay that big
+// regardless of how narrow the visible slice is, since that box is also
+// what determines its radius) -- LVGL's core has to bounding-box-test/skip
+// every object sharing a dirty region on *any* redraw touching it, not just
+// the bargraph's own updates, so more objects there meant slower redraws
+// for the hold-progress bar, the flashing PPO2 label, anything nearby, even
+// with lv_obj_set_style_arc_color() itself gated to only fire on an actual
+// zone-color change (measured on real hardware: ~1.8s/tick at 70 objects,
+// ~190ms at 14, still visibly less responsive at 70 than at 14 even with
+// the gate in place). Replaced below with a single custom-drawn lv_obj
+// (poRing) that paints every bar itself via lv_draw_arc() in one draw
+// pass -- one object, one bounding box, so the per-redraw object-count cost
+// above no longer applies, and the actual bar count is now free to set
+// purely for looks.
+constexpr int SEGMENT_SUBDIV = 2;
 constexpr int TOTAL_BARS = SEGMENT_COUNT * SEGMENT_SUBDIV;
-// lv_arc's software rasterizer truncates every angle to a whole degree at
-// draw time regardless of how precisely it's computed (it casts straight to
-// int32_t -- see lv_draw_sw_arc.c), so bar width and gap are chosen here as
-// plain whole degrees and every one of the TOTAL_BARS bars is laid out as a
-// single flat, evenly-stepped sequence (not derived per real segment) --
-// that's what makes every gap in the ring, whether between two bars in the
-// same 0.1-bar segment or crossing into the next one, come out identical.
-constexpr int BAR_DEG = 1;                 // rendered width of one bar
+// lv_draw_arc() truncates every angle to a whole degree at draw time
+// regardless of how precisely it's computed (lv_value_precise_t is int32_t
+// unless LV_USE_FLOAT is on, which it isn't here), so bar width and gap are
+// chosen here as plain whole degrees and every one of the TOTAL_BARS bars
+// is laid out as a single flat, evenly-stepped sequence (not derived per
+// real segment) -- that's what makes every gap in the ring, whether between
+// two bars in the same 0.1-bar segment or crossing into the next one, come
+// out identical.
+constexpr int BAR_DEG = 4;                 // rendered width of one bar
 constexpr int BAR_GAP_DEG = 1;             // gap between any two adjacent bars, intra- or inter-segment
 constexpr float SEGMENT_RADIUS = 150.0f;
 constexpr int SEGMENT_ARC_WIDTH = 18;
+// One real segment's total angular width (all its sub-bars + the gaps
+// between them) -- used both to size the ring's start offset below and by
+// the "nudge 2/3 of a segment counter-clockwise" adjustment in that same
+// expression (eyeballed against the tick number labels on real hardware).
+constexpr float ONE_SEGMENT_DEG = SEGMENT_SUBDIV * BAR_DEG + (SEGMENT_SUBDIV - 1) * BAR_GAP_DEG;
+// Symmetric leftover between the bars' total angular span and the full
+// PPO2_SCALE_ANGLE_RANGE, applied as a plain float offset (not per-bar) so
+// it doesn't disturb the whole-degree bar/gap spacing above once each bar's
+// angles get truncated at draw time. File-scope (not local to
+// uiDiveScreenCreate()) since ringDrawEventCb() needs it too.
+constexpr float RING_START_DEG = PPO2_SCALE_ROTATION +
+    (PPO2_SCALE_ANGLE_RANGE - (TOTAL_BARS * BAR_DEG + (TOTAL_BARS - 1) * BAR_GAP_DEG)) / 2.0f -
+    ONE_SEGMENT_DEG * 2.0f / 3.0f;
 
 // colInkDim() (0x3f6b5c) at 1/3 brightness -- each channel /3 -- for
 // segments the reading hasn't reached yet.
 inline lv_color_t colSegmentUnlit() { return lv_color_hex(0x15241f); }
 
 static lv_obj_t *poScale;
-static lv_obj_t *poSegments[SEGMENT_COUNT][SEGMENT_SUBDIV];
+static lv_obj_t *poRing; // single custom-drawn widget -- see SEGMENT_SUBDIV's comment above
+// Each zone's current color state (0=unlit/1=red/2=green) -- read directly
+// by ringDrawEventCb() at paint time, so this doubles as both "what to
+// draw" and (compared against on the next tick) "did anything actually
+// change" -- see poRingDirty below.
+static int poSegmentColState[SEGMENT_COUNT];
+// Set whenever uiDiveScreenUpdate() changes a zone's color state; checked
+// (and cleared) right after triggering the one lv_obj_invalidate(poRing)
+// that redraw needs -- keeps the ring untouched, same as before, on ticks
+// where the reading hasn't moved into a new zone.
+static bool poRingDirty = false;
+
+static void ringDrawEventCb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
+  lv_layer_t *layer = lv_event_get_layer(e);
+  lv_obj_t *obj = (lv_obj_t *)lv_event_get_current_target(e);
+
+  lv_area_t coords;
+  lv_obj_get_coords(obj, &coords);
+  lv_point_t center = {(coords.x1 + coords.x2 + 1) / 2, (coords.y1 + coords.y2 + 1) / 2};
+
+  lv_draw_arc_dsc_t dsc;
+  lv_draw_arc_dsc_init(&dsc);
+  dsc.center = center;
+  dsc.radius = (uint16_t)SEGMENT_RADIUS;
+  dsc.width = SEGMENT_ARC_WIDTH;
+  dsc.rounded = false; // flat ends read as "blocks", not a smooth pointer
+
+  for (int i = 0; i < SEGMENT_COUNT; i++) {
+    switch (poSegmentColState[i]) {
+      case 1: dsc.color = colRed(); break;
+      case 2: dsc.color = colGreen(); break;
+      default: dsc.color = colSegmentUnlit(); break;
+    }
+    for (int j = 0; j < SEGMENT_SUBDIV; j++) {
+      int k = i * SEGMENT_SUBDIV + j;
+      float angleStart = RING_START_DEG + k * (BAR_DEG + BAR_GAP_DEG);
+      dsc.start_angle = angleStart;
+      dsc.end_angle = angleStart + BAR_DEG;
+      lv_draw_arc(layer, &dsc);
+    }
+  }
+}
 
 static lv_obj_t *poPO2Value;
+// Alternates with poPO2Value below PPO2_FLASH_THRESHOLD -- normal-font
+// overlay since font_dseg7_46 (poPO2Value's font) is digits/./+/-/space
+// only, same reasoning as poCellFailLabel below.
+static lv_obj_t *poPO2LowLabel;
 static lv_obj_t *poCellLabel[NUM_CELLS];
 static lv_obj_t *poCellValue[NUM_CELLS];
 // A failed cell's formatCellValue() text is "FAIL" -- letters, which the
@@ -118,6 +201,45 @@ static lv_obj_t *mkCenterLabel(lv_obj_t *parent, int y, int width, const lv_font
   lv_obj_set_style_text_font(l, font, 0);
   lv_obj_set_style_text_color(l, color, 0);
   return l;
+}
+
+// Neither lv_label_set_text()/_set_text_fmt() nor lv_obj_set_style_*()
+// compare against the current value before acting -- both unconditionally
+// do their work (text: realloc + memcpy the label's buffer; style props:
+// lv_obj_set_local_style_prop(), see lv_obj_style.c) and both end in an
+// unconditional lv_obj_invalidate(), even when the new value is identical
+// to what's already there (verified by reading both call chains -- an
+// earlier version of this comment assumed style setters had a built-in
+// equality check; they don't). uiDiveScreenUpdate() sets ~12 labels' text
+// *and* color every 20ms tick regardless of whether either actually
+// changed, and poScale's tick/number-label widget spans the *entire*
+// screen (lv_scale requires width==height for round mode, see its own
+// comment), so every one of those unconditional invalidations forces LVGL
+// to also reconsider that large, expensive-to-redraw widget -- measured at
+// several hundred ms/tick on real hardware, confirmed by disabling
+// uiDiveScreenUpdate() entirely and watching the cost disappear. Gating on
+// an actual content change (same discipline as poSegmentColState above)
+// fixes it at the source, same as the arc ring did.
+static void setLabelText(lv_obj_t *label, const char *text) {
+  if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static void setLabelColor(lv_obj_t *label, lv_color_t color) {
+  if (!lv_color_eq(lv_obj_get_style_text_color(label, 0), color)) {
+    lv_obj_set_style_text_color(label, color, 0);
+  }
+}
+
+static void setBgColor(lv_obj_t *obj, lv_color_t color) {
+  if (!lv_color_eq(lv_obj_get_style_bg_color(obj, 0), color)) {
+    lv_obj_set_style_bg_color(obj, color, 0);
+  }
+}
+
+static void setBgOpa(lv_obj_t *obj, lv_opa_t opa) {
+  if (lv_obj_get_style_bg_opa(obj, 0) != opa) {
+    lv_obj_set_style_bg_opa(obj, opa, 0);
+  }
 }
 
 void uiDiveScreenCreate(lv_obj_t *parent) {
@@ -168,54 +290,37 @@ void uiDiveScreenCreate(lv_obj_t *parent) {
   lv_obj_set_style_line_opa(poScale, LV_OPA_TRANSP, LV_PART_INDICATOR); // major tick marks
   lv_obj_set_style_line_opa(poScale, LV_OPA_TRANSP, LV_PART_ITEMS);     // minor tick marks
 
-  // Segmented bargraph: SEGMENT_COUNT discrete blocks, each a background-
-  // only lv_arc (no interactive indicator/knob) spanning a fixed angular
-  // slice with a small gap on either side. Colors are set every tick in
-  // uiDiveScreenUpdate() -- unlit ones stay colSegmentUnlit() the whole time.
+  // Segmented bargraph: a single custom-drawn widget (see ringDrawEventCb()
+  // and SEGMENT_SUBDIV's comment above) rather than one lv_arc per bar --
   // TOTAL_BARS bars, each BAR_DEG wide with BAR_GAP_DEG between it and the
-  // next -- a single flat sequence with no per-segment rounding, so every
-  // gap in the ring is identical whether it falls inside one 0.1-bar
-  // segment or between two of them. The (small, symmetric) leftover between
-  // this and the full PPO2_SCALE_ANGLE_RANGE is a plain float offset here,
-  // not per-bar, so it doesn't disturb the whole-degree bar/gap spacing
-  // above once each bar's angles get truncated at draw time.
-  constexpr float ringStart = PPO2_SCALE_ROTATION +
-      (PPO2_SCALE_ANGLE_RANGE - (TOTAL_BARS * BAR_DEG + (TOTAL_BARS - 1) * BAR_GAP_DEG)) / 2.0f;
-  for (int i = 0; i < SEGMENT_COUNT; i++) {
-    for (int j = 0; j < SEGMENT_SUBDIV; j++) {
-      int k = i * SEGMENT_SUBDIV + j;
-      float angleStart = ringStart + k * (BAR_DEG + BAR_GAP_DEG);
-      float angleEnd = angleStart + BAR_DEG;
-
-      // Parented to `parent`, not poScale: poScale has padding (above) to
-      // shrink its own tick/label radius, and LVGL positions children
-      // relative to a parent's *padded* content box, not its raw top-left --
-      // so a child of poScale would inherit a diagonal offset the ticks
-      // themselves don't have (lv_scale's own tick/label center calc
-      // compensates for its padding internally; a plain child position
-      // doesn't). Parenting here to the padding-free `parent` instead keeps
-      // (180,180) meaning the same absolute point for both.
-      lv_obj_t *seg = lv_arc_create(parent);
-      // The default theme styles a fresh lv_arc as an interactive control --
-      // a colored knob + indicator arc -- neither of which we want here.
-      // remove_style_all() strips those defaults entirely rather than trying
-      // to override every property they touch (a zero-size KNOB style alone
-      // wasn't enough to suppress it).
-      lv_obj_remove_style_all(seg);
-      lv_obj_remove_flag(seg, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_set_size(seg, (int)(SEGMENT_RADIUS * 2), (int)(SEGMENT_RADIUS * 2));
-      lv_obj_set_pos(seg, (int)(180 - SEGMENT_RADIUS), (int)(180 - SEGMENT_RADIUS));
-      lv_arc_set_bg_angles(seg, angleStart, angleEnd);
-      lv_obj_set_style_arc_width(seg, SEGMENT_ARC_WIDTH, LV_PART_MAIN);
-      lv_obj_set_style_arc_rounded(seg, false, LV_PART_MAIN); // flat ends read as "blocks", not a smooth pointer
-      lv_obj_set_style_arc_color(seg, colSegmentUnlit(), LV_PART_MAIN); // initial "unlit" state
-      poSegments[i][j] = seg;
-    }
-  }
+  // next, painted fresh every time the widget redraws (see poRingDirty).
+  //
+  // Parented to `parent`, not poScale: poScale has padding (above) to
+  // shrink its own tick/label radius, and LVGL positions children relative
+  // to a parent's *padded* content box, not its raw top-left -- so a child
+  // of poScale would inherit a diagonal offset the ticks themselves don't
+  // have (lv_scale's own tick/label center calc compensates for its padding
+  // internally; a plain child position doesn't). Parenting here to the
+  // padding-free `parent` instead keeps (180,180) meaning the same absolute
+  // point for both.
+  poRing = lv_obj_create(parent);
+  lv_obj_remove_style_all(poRing);
+  lv_obj_remove_flag(poRing, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_opa(poRing, LV_OPA_TRANSP, 0); // nothing painted but the bars themselves
+  lv_obj_set_size(poRing, (int)(SEGMENT_RADIUS * 2), (int)(SEGMENT_RADIUS * 2));
+  lv_obj_set_pos(poRing, (int)(180 - SEGMENT_RADIUS), (int)(180 - SEGMENT_RADIUS));
+  lv_obj_add_event_cb(poRing, ringDrawEventCb, LV_EVENT_DRAW_MAIN, nullptr);
+  for (int i = 0; i < SEGMENT_COUNT; i++) poSegmentColState[i] = 0; // matches colSegmentUnlit()
 
   // ---- readout inside the dial's empty bowl ----
   poPO2Value = mkCenterLabel(parent, 64, DEVICE_W, &font_dseg7_46, colGreen()); // 7-segment style
   lv_label_set_text(poPO2Value, "0.70");
+
+  // Roughly centered on poPO2Value's line (46px 7-segment vs. this 28px
+  // label) -- close enough for an alternating warning, not pixel-matched.
+  poPO2LowLabel = mkCenterLabel(parent, 78, DEVICE_W, &lv_font_montserrat_28, colRed());
+  lv_label_set_text(poPO2LowLabel, "LOW PPO2");
+  lv_obj_add_flag(poPO2LowLabel, LV_OBJ_FLAG_HIDDEN);
 
   // ---- middle band: cells / SRC / S.P. / depth / deco ----
   static const char *cellNames[NUM_CELLS] = {"C1", "C2", "C3"};
@@ -414,8 +519,8 @@ void uiDiveScreenUpdate() {
     float consensus = 0;
     computeConsensus(&consensus);
     ppo2 = consensus;
-    snprintf(po2Text, sizeof(po2Text), "%.2f", consensus);
-    bool low = consensus < 0.5f;
+    snprintf(po2Text, sizeof(po2Text), "%.2f", ppo2);
+    bool low = ppo2 < 0.5f;
     po2Color = low ? colRed() : colGreen();
     if (low) {
       ppo2AlertText = "LOW PO2 - CHECK LOOP";
@@ -423,8 +528,26 @@ void uiDiveScreenUpdate() {
       ppo2AlertText = "NO SAFE BAILOUT GAS";
     }
   }
-  lv_label_set_text(poPO2Value, po2Text);
-  lv_obj_set_style_text_color(poPO2Value, po2Color, 0);
+  setLabelColor(poPO2Value, po2Color);
+
+  // Below PPO2_FLASH_THRESHOLD, cycle the headline between the numeric
+  // reading and a "LOW PPO2" warning (rather than blinking the value off/
+  // on) -- keeps cycling for as long as the condition holds, reverting to
+  // steady numeric display the moment ppo2 climbs back above the
+  // threshold. The segmented bargraph is left alone -- only the headline
+  // cycles.
+  bool showValue = true;
+  if (ppo2 <= PPO2_FLASH_THRESHOLD) {
+    showValue = (lv_tick_get() % PPO2_FLASH_PERIOD_MS) >= PPO2_FLASH_OFF_MS;
+  }
+  if (showValue) {
+    setLabelText(poPO2Value, po2Text);
+    lv_obj_remove_flag(poPO2Value, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(poPO2LowLabel, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(poPO2Value, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(poPO2LowLabel, LV_OBJ_FLAG_HIDDEN);
+  }
 
   int32_t ppo2Cbar = (int32_t)(ppo2 * 100.0f + 0.5f);
   if (ppo2Cbar < PPO2_MIN_CBAR) ppo2Cbar = PPO2_MIN_CBAR;
@@ -432,22 +555,30 @@ void uiDiveScreenUpdate() {
 
   // Segmented build-up: light every block from the low end up to the
   // current reading, colored by its own zone; anything beyond the reading
-  // stays dim/"unlit".
+  // stays dim/"unlit". Updates poSegmentColState (what ringDrawEventCb()
+  // paints) and invalidates poRing at most once, only if a zone's state
+  // actually changed -- same "untouched on an unchanging reading" discipline
+  // as the old per-object version, just scoped to one widget instead of
+  // SEGMENT_COUNT of them.
   {
     constexpr int32_t cbarRange = PPO2_MAX_CBAR - PPO2_MIN_CBAR;
     for (int i = 0; i < SEGMENT_COUNT; i++) {
       int32_t segStartCbar = PPO2_MIN_CBAR + i * cbarRange / SEGMENT_COUNT;
-      lv_color_t col;
+      int colState;
       if (ppo2Cbar < segStartCbar) {
-        col = colSegmentUnlit();
+        colState = 0;
       } else if (segStartCbar < PPO2_RED_LOW_MAX_CBAR || segStartCbar >= PPO2_RED_HIGH_MIN_CBAR) {
-        col = colRed();
+        colState = 1;
       } else {
-        col = colGreen();
+        colState = 2;
       }
-      for (int j = 0; j < SEGMENT_SUBDIV; j++) {
-        lv_obj_set_style_arc_color(poSegments[i][j], col, LV_PART_MAIN);
-      }
+      if (colState == poSegmentColState[i]) continue; // unchanged since last tick -- nothing to redraw
+      poSegmentColState[i] = colState;
+      poRingDirty = true;
+    }
+    if (poRingDirty) {
+      lv_obj_invalidate(poRing);
+      poRingDirty = false;
     }
   }
 
@@ -467,8 +598,8 @@ void uiDiveScreenUpdate() {
       char buf[8];
       lv_color_t c;
       formatCellValue(i, buf, sizeof(buf), &c);
-      lv_label_set_text(poCellValue[i], buf);
-      lv_obj_set_style_text_color(poCellValue[i], c, 0);
+      setLabelText(poCellValue[i], buf);
+      setLabelColor(poCellValue[i], c);
       lv_obj_remove_flag(poCellValue[i], LV_OBJ_FLAG_HIDDEN);
       lv_obj_add_flag(poCellFailLabel[i], LV_OBJ_FLAG_HIDDEN);
     }
@@ -480,22 +611,26 @@ void uiDiveScreenUpdate() {
     float candP = candidate.fo2 * ata(state.depth);
     char gasBuf[24];
     formatGasCandidate(candidate, gasBuf, sizeof(gasBuf));
-    lv_label_set_text_fmt(poSrcValue, "-> %s", gasBuf);
+    char srcBuf[32];
+    snprintf(srcBuf, sizeof(srcBuf), "-> %s", gasBuf);
+    setLabelText(poSrcValue, srcBuf);
     bool candUnsafe = candP < PPO2_HYPOXIA_MIN || candP > PPO2_TOX_MAX;
     bool candBest = !candUnsafe && pickBestBailoutGas(state.depth) == &candidate;
-    lv_obj_set_style_text_color(poSrcValue, candUnsafe ? colRed() : (candBest ? colGreen() : colYellow()), 0);
+    setLabelColor(poSrcValue, candUnsafe ? colRed() : (candBest ? colGreen() : colYellow()));
   } else if (eff.isBailout) {
     if (eff.gas) {
       char gasBuf[24];
       formatGasCandidate(*eff.gas, gasBuf, sizeof(gasBuf));
-      lv_label_set_text_fmt(poSrcValue, "OC . %s", gasBuf);
+      char srcBuf[32];
+      snprintf(srcBuf, sizeof(srcBuf), "OC . %s", gasBuf);
+      setLabelText(poSrcValue, srcBuf);
     } else {
-      lv_label_set_text(poSrcValue, "OC . --");
+      setLabelText(poSrcValue, "OC . --");
     }
-    lv_obj_set_style_text_color(poSrcValue, colYellow(), 0);
+    setLabelColor(poSrcValue, colYellow());
   } else {
-    lv_label_set_text(poSrcValue, "CC");
-    lv_obj_set_style_text_color(poSrcValue, colCyan(), 0);
+    setLabelText(poSrcValue, "CC");
+    setLabelColor(poSrcValue, colCyan());
   }
 
   if (spDisplayBlanked(editingSp)) {
@@ -504,11 +639,11 @@ void uiDiveScreenUpdate() {
     // preserved untouched in state.spMode and comes back once back on the
     // loop; see pressMenu()'s bailout branch, which already keeps SpEdit
     // unreachable from here).
-    lv_label_set_text(poSpValue, "--");
-    lv_obj_set_style_text_color(poSpValue, colInkDim(), 0);
+    setLabelText(poSpValue, "--");
+    setLabelColor(poSpValue, colInkDim());
   } else {
-    lv_label_set_text(poSpValue, spModeName(spShown));
-    lv_obj_set_style_text_color(poSpValue, editingSp ? colCyan() : lv_color_white(), 0);
+    setLabelText(poSpValue, spModeName(spShown));
+    setLabelColor(poSpValue, editingSp ? colCyan() : lv_color_white());
   }
 
   if (editingSp) {
@@ -546,13 +681,30 @@ void uiDiveScreenUpdate() {
     char *dot = strchr(buf, '.');
     char frac = dot && dot[1] ? dot[1] : '0';
     if (dot) dot[1] = '\0'; // truncate buf to "<whole>."
-    lv_label_set_text(poDepthValue, buf);
-    lv_label_set_text_fmt(poDepthFrac, "%c", frac);
+    setLabelText(poDepthValue, buf);
+    char fracBuf[2] = {frac, '\0'};
+    setLabelText(poDepthFrac, fracBuf);
     lv_obj_update_layout(poDepthValue); // finalize content-width before measuring it below
-    lv_obj_set_pos(poDepthFrac, DEPTH_VALUE_X + lv_obj_get_width(poDepthValue), DEPTH_FRAC_Y);
+    // Only reposition when the whole-part's rendered width actually
+    // changed (e.g. "9." -> "10.") -- lv_obj_set_pos() invalidates both the
+    // old and new rects unconditionally, which is wasted work on the very
+    // common case of the digit count staying the same tick to tick, and
+    // this label sits inside the segmented ring's shared bounding region
+    // (see poSegmentColState's comment above).
+    static int lastDepthFracX = -1;
+    int depthFracX = DEPTH_VALUE_X + lv_obj_get_width(poDepthValue);
+    if (depthFracX != lastDepthFracX) {
+      lastDepthFracX = depthFracX;
+      lv_obj_set_pos(poDepthFrac, depthFracX, DEPTH_FRAC_Y);
+    }
   }
-  if (cache.tts >= 0) lv_label_set_text_fmt(poTtsValue, "%d", cache.tts);
-  else lv_label_set_text(poTtsValue, "--");
+  if (cache.tts >= 0) {
+    char ttsBuf[8];
+    snprintf(ttsBuf, sizeof(ttsBuf), "%d", cache.tts);
+    setLabelText(poTtsValue, ttsBuf);
+  } else {
+    setLabelText(poTtsValue, "--");
+  }
 
   int ceilD = cache.ceilD;
   bool belowCeiling = ceilD > 0 && state.depth < ceilD;
@@ -567,8 +719,8 @@ void uiDiveScreenUpdate() {
     else snprintf(decoVal, sizeof(decoVal), "STOP %dm  240+", ceilD);
     decoColor = belowCeiling ? colRed() : colYellow();
   }
-  lv_label_set_text(poDecoValue, decoVal);
-  lv_obj_set_style_text_color(poDecoValue, decoColor, 0);
+  setLabelText(poDecoValue, decoVal);
+  setLabelColor(poDecoValue, decoColor);
 
   // ---- bottom banner: auto-bailout > ceiling violation > PO2 alert > edit hint ----
   // Shares its row with poStatsLine (only one of the two is visible at a
@@ -592,17 +744,17 @@ void uiDiveScreenUpdate() {
   }
 
   if (alertText) {
-    lv_obj_set_style_bg_color(poBanner, alertIsCaution ? colYellow() : colRed(), 0);
-    lv_obj_set_style_bg_opa(poBanner, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(poBannerLabel, lv_color_hex(0x170403), 0);
-    lv_label_set_text(poBannerLabel, alertText);
+    setBgColor(poBanner, alertIsCaution ? colYellow() : colRed());
+    setBgOpa(poBanner, LV_OPA_COVER);
+    setLabelColor(poBannerLabel, lv_color_hex(0x170403));
+    setLabelText(poBannerLabel, alertText);
     lv_obj_remove_flag(poBanner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(poStatsLine, LV_OBJ_FLAG_HIDDEN);
   } else if (editingSp || editingGas) {
-    lv_obj_set_style_bg_color(poBanner, colCyan(), 0);
-    lv_obj_set_style_bg_opa(poBanner, LV_OPA_20, 0);
-    lv_obj_set_style_text_color(poBannerLabel, colCyan(), 0);
-    lv_label_set_text(poBannerLabel, editingGas ? "MENU=next gas  ACTION=ok" : "MENU=next  ACTION=ok");
+    setBgColor(poBanner, colCyan());
+    setBgOpa(poBanner, LV_OPA_20);
+    setLabelColor(poBannerLabel, colCyan());
+    setLabelText(poBannerLabel, editingGas ? "MENU=next gas  ACTION=ok" : "MENU=next  ACTION=ok");
     lv_obj_remove_flag(poBanner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(poStatsLine, LV_OBJ_FLAG_HIDDEN);
   } else {
@@ -611,7 +763,7 @@ void uiDiveScreenUpdate() {
 
     char statsBuf[32];
     snprintf(statsBuf, sizeof(statsBuf), "%d min  MAX %.1fm", (int)state.diveTime, state.maxDepth);
-    lv_label_set_text(poStatsLine, statsBuf);
+    setLabelText(poStatsLine, statsBuf);
   }
 }
 
