@@ -9,16 +9,20 @@
 #include "app_hal.h"
 #include "device_profile.h"
 
-// Note on Menu/Action input: the CYD has no physical buttons of its own
-// (unlike the APECS4 this UI is modeled on), so real-hardware input is still
-// an open question — either two GPIO buttons wired in separately, or
-// touchscreen zones. Not decided yet, so it's not wired up on the `cyd`
-// build target. For now onMenuDown()/onMenuUp()/onActionDown()/onActionUp()
-// are only ever called from the sim-only debug panel (see
-// input_sim_debug.cpp), which is enough to exercise the whole state
-// machine — short presses, the hold-Menu gas-edit toggle, and the
+// Note on Menu/Action input: neither panel has physical buttons of its own
+// (unlike the APECS4 this UI is modeled on). On `round`, app_hal.cpp polls
+// two capacitive touch pins (GPIO2/GPIO4 -- see
+// displays/LGFX_GC9B72_360.hpp) and calls onMenuDown()/onMenuUp()/
+// onActionDown()/onActionUp() directly from there; that's a bench-testing
+// stand-in only, to be swapped for real mechanical buttons once those are
+// wired in. On `cyd`, real-hardware input is still an open question —
+// either two GPIO buttons wired in separately, or touchscreen zones — so
+// nothing is wired up there yet. In the simulator (no real input hardware
+// at all), the same four calls come from the sim-only debug panel instead
+// (see input_sim_debug.cpp). Either way it's enough to exercise the whole
+// state machine — short presses, the hold-Menu gas-edit toggle, and the
 // hold-Action-to-sleep gesture (see gestures.h's GAS_EDIT_HOLD_MS/
-// SHUTDOWN_HOLD_MS) — while the input question gets settled.
+// SHUTDOWN_HOLD_MS).
 
 namespace dc {
 
