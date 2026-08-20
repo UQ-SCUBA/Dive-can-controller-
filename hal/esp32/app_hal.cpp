@@ -13,6 +13,7 @@
 /* include only one display settings */
 #if defined(DEVICE_SHAPE_ROUND)
 #include "displays/LGFX_GC9B72_360.hpp"
+#include "dive_can_hal.h"
 #else
 #include "displays/LGFX_CYD_2432S028.hpp"
 #endif
@@ -263,6 +264,7 @@ void hal_setup(void)
   // which direction triggered them.
   attachInterrupt(digitalPinToInterrupt(MENU_BTN_GPIO), menuPinIsr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ACTION_BTN_GPIO), actionPinIsr, CHANGE);
+  diveCanHalInit();
 #endif
 }
 
@@ -274,6 +276,7 @@ void hal_loop(void)
   esp_task_wdt_reset();
 #if defined(DEVICE_SHAPE_ROUND)
   pollButtons();
+  diveCanHalPoll();
 #endif
   lv_timer_handler(); // Update the UI-
   delay(5);

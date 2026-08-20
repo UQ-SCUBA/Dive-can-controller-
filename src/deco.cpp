@@ -1,4 +1,5 @@
 #include "deco.h"
+#include "dive_can.h"
 #include <cmath>
 
 namespace dc {
@@ -104,13 +105,25 @@ float gasMOD(const GasMix &g) {
   return floorf(((MOD_CEILING / g.fo2) - 1.0f) * 10.0f);
 }
 
-// Loop PO2 tracks the active setpoint (solenoid holds the loop there).
-float cellBaseValue(int /*idx*/) {
-  float target = spValue(state.spMode);
-  return target < 0.0f ? 0.0f : target;
-}
+// Real per-cell PPO2 as received over the DiveCAN bus (see dive_can.cpp's
+// applyPpo2()) -- on the emulator/before the bus has ever come up, this
+// just reads state.cellPpo2Bar's init default (matching the old
+// setpoint-tracking stand-in) rather than 0.00. Was a hardcoded
+// spValue(state.spMode) stand-in before the real bus receive existed.
+float cellBaseValue(int idx) { return state.cellPpo2Bar[idx]; }
 
 bool computeConsensus(float *outPo2) {
+  // Prefer the Cell Status message's own consensus byte over re-deriving
+  // one client-side, per docs/DiveCAN_Protocol_Reference.md ("There is no
+  // relationship between PPO2, millivolts, and the consensus value on the
+  // handset side... Values are used and displayed verbatim as they come
+  // over the bus"). Falls back to averaging Ok cells only when no real
+  // Cell Status message has arrived yet (emulator, or real hardware before
+  // the bus comes up).
+  if (state.consensusPpo2Valid) {
+    *outPo2 = state.consensusPpo2Bar;
+    return true;
+  }
   float sum = 0.0f;
   int n = 0;
   for (int i = 0; i < NUM_CELLS; i++) {
@@ -173,6 +186,22 @@ static bool activeInertSource(float depthM, float *outFo2, float *outFhe, float 
     *outFo2 = eff.gas->fo2;
     *outFhe = eff.gas->fhe;
     *outPpo2 = eff.gas->fo2 * ata(depthM);
+    return true;
+  }
+  // Still nominally on the loop, but if the DiveCAN bus has gone quiet the
+  // loop's actual PPO2 can no longer be trusted for tissue loading. This
+  // deliberately does NOT touch state.source/getEffectiveSource() — the
+  // UI's SRC indicator and S.P. editability keep showing Loop/CC exactly
+  // as before (no auto-switch to OC) — it only changes what the deco
+  // engine itself assumes: the diver's actual best move at this depth (the
+  // gas they'd bail out to), so NDL/stop-time/TTS stay conservative
+  // instead of silently continuing to integrate a stale/frozen reading.
+  if (isCanBusLost()) {
+    const GasMix *g = pickBestBailoutGas(depthM);
+    if (g == nullptr) return false;
+    *outFo2 = g->fo2;
+    *outFhe = g->fhe;
+    *outPpo2 = g->fo2 * ata(depthM);
     return true;
   }
   if (!computeConsensus(outPpo2)) return false;

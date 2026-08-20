@@ -1,6 +1,7 @@
 #include "ui_dive_screen.h"
 #include "state.h"
 #include "deco.h"
+#include "dive_can.h"
 #include "ui_common.h"
 #include "device_profile.h"
 #include "fonts/font_dseg7.h"
@@ -37,6 +38,12 @@ constexpr int32_t PPO2_RED_HIGH_MIN_CBAR = 140; // red zone: 1.40-1.70 (extends 
 constexpr float PPO2_FLASH_THRESHOLD = 0.35f;
 constexpr uint32_t PPO2_FLASH_OFF_MS = 500;     // "LOW PPO2" shown for this long
 constexpr uint32_t PPO2_FLASH_PERIOD_MS = 1000; // ...then the value for the remaining 0.5s
+
+// ---- CAN-bus-lost flash (cells + headline PO2 value, plain on/off blink
+// in red -- distinct from the low-PO2 text-cycle above, since there's no
+// equivalent short warning text for "this reading is stale/not live") ----
+constexpr uint32_t CAN_LOST_FLASH_OFF_MS = 500;
+constexpr uint32_t CAN_LOST_FLASH_PERIOD_MS = 1000; // 0.5s off, 0.5s on
 
 constexpr int32_t PPO2_SCALE_ANGLE_RANGE = 150; // sweeps low end -> high end
 // Centered symmetrically on 270 deg (12 o'clock, in lv_scale's clockwise-
@@ -240,6 +247,15 @@ static void setBgOpa(lv_obj_t *obj, lv_opa_t opa) {
   if (lv_obj_get_style_bg_opa(obj, 0) != opa) {
     lv_obj_set_style_bg_opa(obj, opa, 0);
   }
+}
+
+// Shared by every on/off blink in this file (see CAN_LOST_FLASH_*/
+// PPO2_FLASH_* above) -- lv_obj_add_flag()/remove_flag() already no-op
+// when the object is already in the target state (see lv_obj.c), so this
+// is safe to call unconditionally every tick without its own change-gate.
+static void setFlashVisible(lv_obj_t *obj, bool visible) {
+  if (visible) lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
 
 void uiDiveScreenCreate(lv_obj_t *parent) {
@@ -474,6 +490,21 @@ void uiDiveScreenCreate(lv_obj_t *parent) {
 void uiDiveScreenUpdate() {
   EffectiveSource eff = getEffectiveSource();
 
+  // ---- CAN-bus-lost flash: cells + headline PO2 value blink red for as
+  // long as the bus stays quiet (see dive_can.h's isCanBusLost() and
+  // deco.cpp's activeInertSource(), which separately makes the deco engine
+  // assume the diver's best bailout gas at depth while this holds --
+  // deliberately NOT reflected here or in eff/state.source, so SRC/S.P.
+  // keep reading Loop/CC exactly as if the bus were healthy). Takes
+  // priority over the low-PO2 text-cycle below on the headline value --
+  // once the bus is back, whichever of the two conditions still applies
+  // takes back over next tick.
+  bool canLost = isCanBusLost();
+  bool canFlashOn = true;
+  if (canLost) {
+    canFlashOn = (lv_tick_get() % CAN_LOST_FLASH_PERIOD_MS) >= CAN_LOST_FLASH_OFF_MS;
+  }
+
   const char *autoBanner = nullptr;
   static char autoBannerBuf[40];
   if (eff.isAuto) {
@@ -528,25 +559,29 @@ void uiDiveScreenUpdate() {
       ppo2AlertText = "NO SAFE BAILOUT GAS";
     }
   }
-  setLabelColor(poPO2Value, po2Color);
-
-  // Below PPO2_FLASH_THRESHOLD, cycle the headline between the numeric
-  // reading and a "LOW PPO2" warning (rather than blinking the value off/
-  // on) -- keeps cycling for as long as the condition holds, reverting to
-  // steady numeric display the moment ppo2 climbs back above the
-  // threshold. The segmented bargraph is left alone -- only the headline
-  // cycles.
-  bool showValue = true;
-  if (ppo2 <= PPO2_FLASH_THRESHOLD) {
-    showValue = (lv_tick_get() % PPO2_FLASH_PERIOD_MS) >= PPO2_FLASH_OFF_MS;
-  }
-  if (showValue) {
-    setLabelText(poPO2Value, po2Text);
-    lv_obj_remove_flag(poPO2Value, LV_OBJ_FLAG_HIDDEN);
+  setLabelText(poPO2Value, po2Text);
+  if (canLost) {
+    // Bus-lost blink wins over the low-PO2 text-cycle below -- the reading
+    // itself is stale while this holds, so cycling to "LOW PPO2" text
+    // (which implies a live, trustworthy value) would be misleading. Just
+    // blink the last-known number in red.
+    setLabelColor(poPO2Value, colRed());
+    setFlashVisible(poPO2Value, canFlashOn);
     lv_obj_add_flag(poPO2LowLabel, LV_OBJ_FLAG_HIDDEN);
   } else {
-    lv_obj_add_flag(poPO2Value, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(poPO2LowLabel, LV_OBJ_FLAG_HIDDEN);
+    setLabelColor(poPO2Value, po2Color);
+    // Below PPO2_FLASH_THRESHOLD, cycle the headline between the numeric
+    // reading and a "LOW PPO2" warning (rather than blinking the value
+    // off/on) -- keeps cycling for as long as the condition holds,
+    // reverting to steady numeric display the moment ppo2 climbs back
+    // above the threshold. The segmented bargraph is left alone -- only
+    // the headline cycles.
+    bool showValue = true;
+    if (ppo2 <= PPO2_FLASH_THRESHOLD) {
+      showValue = (lv_tick_get() % PPO2_FLASH_PERIOD_MS) >= PPO2_FLASH_OFF_MS;
+    }
+    setFlashVisible(poPO2Value, showValue);
+    setFlashVisible(poPO2LowLabel, !showValue);
   }
 
   int32_t ppo2Cbar = (int32_t)(ppo2 * 100.0f + 0.5f);
@@ -591,16 +626,18 @@ void uiDiveScreenUpdate() {
     if (state.cells[i] == CellState::Fail) {
       // formatCellValue() would return literal "FAIL" text here, which the
       // 7-segment font can't render (letters) -- show the normal-font
-      // overlay instead and skip the numeric label entirely.
+      // overlay instead and skip the numeric label entirely. Its color is
+      // fixed red at creation already, so canLost only needs to blink its
+      // visibility, not its color.
       lv_obj_add_flag(poCellValue[i], LV_OBJ_FLAG_HIDDEN);
-      lv_obj_remove_flag(poCellFailLabel[i], LV_OBJ_FLAG_HIDDEN);
+      setFlashVisible(poCellFailLabel[i], !canLost || canFlashOn);
     } else {
       char buf[8];
       lv_color_t c;
       formatCellValue(i, buf, sizeof(buf), &c);
       setLabelText(poCellValue[i], buf);
-      setLabelColor(poCellValue[i], c);
-      lv_obj_remove_flag(poCellValue[i], LV_OBJ_FLAG_HIDDEN);
+      setLabelColor(poCellValue[i], canLost ? colRed() : c);
+      setFlashVisible(poCellValue[i], !canLost || canFlashOn);
       lv_obj_add_flag(poCellFailLabel[i], LV_OBJ_FLAG_HIDDEN);
     }
   }

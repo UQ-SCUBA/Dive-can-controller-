@@ -37,7 +37,10 @@ inline void formatCellValue(int idx, char *buf, size_t n, lv_color_t *outColor) 
     snprintf(buf, n, "FAIL");
     *outColor = colRed();
   } else if (s == CellState::Voted) {
-    snprintf(buf, n, "0.52");
+    // Excluded from consensus (see dive_can.cpp's applyCellStatus()), but
+    // still a real reading -- show it, just colored to flag it as
+    // untrusted rather than substituting a fixed placeholder value.
+    snprintf(buf, n, "%.2f", cellBaseValue(idx));
     *outColor = colYellow();
   } else {
     snprintf(buf, n, "%.2f", cellBaseValue(idx));

@@ -35,6 +35,19 @@ struct GasMix {
 
 struct State {
   CellState cells[NUM_CELLS] = {CellState::Ok, CellState::Ok, CellState::Ok};
+  // Per-cell PPO2, bar -- driven by real DiveCAN PPO2 messages (0x04) on
+  // `round` hardware once the bus is up (see dive_can.cpp); on the
+  // emulator/debug-panel builds, and before the first real message, this
+  // just sits at the default below (matching cellBaseValue()'s old
+  // setpoint-tracking stand-in) rather than reading as 0.00.
+  float cellPpo2Bar[NUM_CELLS] = {0.7f, 0.7f, 0.7f};
+  // Cell Status message's (0xCA) consensus byte -- what the deco engine
+  // should read on loop, not a client-side re-average of the three cells
+  // (see docs/DiveCAN_Protocol_Reference.md). consensusPpo2Valid stays
+  // false (falling back to averaging cellPpo2Bar over Ok cells, see
+  // computeConsensus()) until the first real Cell Status message arrives.
+  float consensusPpo2Bar = 0.7f;
+  bool consensusPpo2Valid = false;
   SpMode spMode = SpMode::Sp07;
   Source source = Source::Loop;
   int bailoutGasIdx = 0;
